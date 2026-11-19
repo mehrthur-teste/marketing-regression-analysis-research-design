@@ -1,0 +1,416 @@
+---
+title: "Marketing Regression Analysis and Research Design"
+format: html
+engine: knitr
+editor: visual
+lang: en
+---
+
+## 3. Data Preparation in R
+
+In RStudio, use **Run All** to execute the preparation in order, or use **Render** to build the HTML report. To rerun a supplementary block in a fresh R session, use **Run All Chunks Above** first.
+
+### UCI listings and the analysis window
+
+The assigned UCI listings define the sample, asking rents, and posting dates. Use the 10,000-listing extract selected for this analysis. Derive the inclusive analysis window from its valid timestamps before applying listing filters. All dates below use UTC consistently. [UCI Apartment for Rent Classified](https://doi.org/10.24432/C5X623)
+
+```{r}
+#| label: import-uci
+data_dir <- "data"
+if (!file.exists(file.path(data_dir, "uci-apartments.zip")) &&
+    interactive() && requireNamespace("rstudioapi", quietly = TRUE) &&
+    rstudioapi::isAvailable()) {
+  document_path <- rstudioapi::getSourceEditorContext()$path
+  if (nzchar(document_path)) data_dir <- file.path(dirname(document_path), "data")
+}
+uci_zip <- file.path(data_dir, "uci-apartments.zip")
+if (!file.exists(uci_zip)) {
+  stop("Cannot find data/uci-apartments.zip. Open the Quarto file from the project folder.",
+       call. = FALSE)
+}
+data_dir <- normalizePath(data_dir, mustWork = TRUE)
+working_dir <- tempfile("rental-inputs-")
+dir.create(working_dir)
+
+uci_archive <- unzip(
+  file.path(data_dir, "uci-apartments.zip"),
+  files = "apartments_for_rent_classified_10K.7z",
+  exdir = working_dir
+)
+extract_status <- system2("tar", c("-xf", shQuote(uci_archive), "-C", shQuote(working_dir)))
+if (extract_status != 0L) stop("The UCI archive could not be extracted.")
+
+uci_csv <- list.files(
+  working_dir, pattern = "[.]csv$", recursive = TRUE, full.names = TRUE
+)
+stopifnot(length(uci_csv) == 1L)
+
+uci <- read.delim(
+  uci_csv, sep = ";", quote = "", comment.char = "", fill = FALSE,
+  colClasses = "character", fileEncoding = "latin1",
+  na.strings = c("", "null", "NA")
+)
+uci[] <- lapply(uci, function(values) {
+  values <- trimws(values)
+  values[tolower(values) %in% c("", "null", "na")] <- NA_character_
+  values
+})
+raw_fields <- names(uci)
+uci$posting_date <- as.Date(
+  as.POSIXct(suppressWarnings(as.numeric(uci$time)), origin = "1970-01-01", tz = "UTC"),
+  tz = "UTC"
+)
+stopifnot(any(!is.na(uci$posting_date)))
+window <- range(uci$posting_date, na.rm = TRUE)
+knitr::kable(data.frame(
+  Listings = nrow(uci), First_date = window[1], Last_date = window[2],
+  Missing_dates = sum(is.na(uci$posting_date))
+))
+```
+
+### Missing values, duplicates, and variable types
+
+Report missingness on all source rows before filtering. Check for identical records, repeated listing IDs, and identical content under different IDs. The unit of analysis is a listing. Different ads for the same address may describe different units or listing events, so address alone is insufficient evidence of duplication.
+
+```{r}
+#| label: uci-quality-audit
+review_fields <- c(
+  "id", "category", "price", "currency", "price_type", "square_feet", "bedrooms",
+  "bathrooms", "pets_allowed", "amenities", "has_photo", "cityname", "state",
+  "latitude", "longitude", "time"
+)
+missing_n <- colSums(is.na(uci[review_fields]))
+knitr::kable(data.frame(
+  Field = review_fields,
+  Missing = as.integer(missing_n),
+  Percent = round(100 * missing_n / nrow(uci), 2),
+  row.names = NULL
+))
+
+exact_duplicate <- duplicated(uci[raw_fields])
+repeated_id <- !is.na(uci$id) & duplicated(uci$id)
+repeated_content <- duplicated(uci[setdiff(raw_fields, "id")])
+knitr::kable(data.frame(
+  Check = c("Exact repeat rows", "Repeated nonmissing IDs", "Repeat rows ignoring ID"),
+  Rows = c(sum(exact_duplicate), sum(repeated_id), sum(repeated_content))
+))
+
+numeric_fields <- c("price", "square_feet", "bedrooms", "bathrooms", "latitude", "longitude")
+parse_number <- function(values) suppressWarnings(as.numeric(values))
+type_failures <- vapply(uci[numeric_fields], function(values) {
+  sum(!is.na(values) & !is.finite(parse_number(values)))
+}, integer(1))
+knitr::kable(data.frame(
+  Field = numeric_fields, Invalid_numeric_text = as.integer(type_failures)
+))
+
+listings <- uci[!exact_duplicate, , drop = FALSE]
+listings$bathrooms_missing <- is.na(listings$bathrooms)
+for (field in numeric_fields) listings[[field]] <- parse_number(listings[[field]])
+knitr::kable(as.data.frame(table(listings$has_photo, useNA = "ifany")),
+             col.names = c("Raw photo category", "Listings"))
+```
+
+Retain apartment ads with a clearly monthly asking price in USD, positive price and floor area, a valid bedroom count, and a city and state for within-market comparisons. Keep zero bedrooms as a valid studio count. For a missing bathroom count, use one bathroom as a conservative working assumption and flag the imputation. Preserve reported half-baths. A later sensitivity check will repeat the model using listings with reported bathroom counts.
+
+Interpret `None` in `pets_allowed` as neither cats nor dogs permitted for this analysis. Use it as the reference category. Listings reporting cats, dogs, or both form the **Cats or dogs allowed** category. Blank entries stay in **Policy unknown** because the listing gives no basis for inferring the rule. Use the most frequent city–state pair as the geographic reference. Retain the prepared pool and photo indicators for supplementary analyses.
+
+```{r}
+#| label: clean-uci
+filters <- list(
+  "Apartment listing" = listings$category == "housing/rent/apartment",
+  "Monthly rent in USD" = listings$price_type == "Monthly" & listings$currency == "USD",
+  "Valid posting date" = !is.na(listings$posting_date),
+  "Positive price and floor area" = is.finite(listings$price) & listings$price > 0 &
+    is.finite(listings$square_feet) & listings$square_feet > 0,
+  "Valid bedroom count" = is.finite(listings$bedrooms) & listings$bedrooms >= 0 &
+    listings$bedrooms == floor(listings$bedrooms),
+  "Reported bathroom count positive or missing" = listings$bathrooms_missing |
+    (is.finite(listings$bathrooms) & listings$bathrooms > 0),
+  "Known U.S. city and state" = !is.na(listings$cityname) &
+    listings$state %in% c(state.abb, "DC")
+)
+keep <- rep(TRUE, nrow(listings))
+remaining <- c(nrow(uci), nrow(listings))
+for (passes in filters) {
+  keep <- keep & !is.na(passes) & passes
+  remaining <- c(remaining, sum(keep))
+}
+knitr::kable(data.frame(
+  Step = c("Source listings", "Remove exact repeat rows", names(filters)),
+  Removed_at_step = c(0L, -diff(remaining)),
+  Remaining = remaining
+))
+
+listings <- listings[keep, , drop = FALSE]
+listings$area_100_sqft <- listings$square_feet / 100
+listings$bathrooms_prepared <- listings$bathrooms
+listings$bathrooms_prepared[listings$bathrooms_missing] <- 1
+pet_code <- tolower(gsub("[[:space:]]", "", listings$pets_allowed))
+stopifnot(all(is.na(pet_code) | pet_code %in% c("none", "cats", "dogs", "cats,dogs", "dogs,cats")))
+listings$pet_policy <- factor(
+  ifelse(is.na(pet_code), "Policy unknown",
+         ifelse(pet_code == "none", "Neither cats nor dogs allowed", "Cats or dogs allowed")),
+  levels = c("Neither cats nor dogs allowed", "Cats or dogs allowed", "Policy unknown")
+)
+primary_formula <- price ~ area_100_sqft + bedrooms + bathrooms_prepared + pet_policy + city_state
+reported_bathroom_rows <- !listings$bathrooms_missing
+listings$photo_status <- factor(
+  ifelse(listings$has_photo %in% c("Yes", "Thumbnail"), "Photo present",
+         ifelse(listings$has_photo == "No", "No photo", NA_character_)),
+  levels = c("No photo", "Photo present")
+)
+pool_token <- grepl("(^|,)\\s*pool\\s*(,|$)", listings$amenities, ignore.case = TRUE)
+listings$pool_status <- factor(
+  ifelse(is.na(listings$amenities), "Amenities missing",
+         ifelse(pool_token, "Pool mentioned", "Pool not mentioned")),
+  levels = c("Pool not mentioned", "Pool mentioned", "Amenities missing")
+)
+listings$city_state <- factor(paste(listings$cityname, listings$state, sep = ", "))
+market_reference <- names(sort(table(listings$city_state), decreasing = TRUE))[1]
+listings$city_state <- relevel(listings$city_state, ref = market_reference)
+
+knitr::kable(as.data.frame(table(listings$pet_policy)),
+             col.names = c("Prepared pet policy", "Listings"))
+knitr::kable(data.frame(
+  Bathroom_status = c("Reported", "Imputed as one"),
+  Listings = c(sum(reported_bathroom_rows), sum(!reported_bathroom_rows))
+))
+```
+
+The raw data had **`r sum(exact_duplicate)` exact repeat rows** and **`r sum(repeated_id)` repeated listing IDs**. Amenities were missing in **`r round(100 * missing_n["amenities"] / nrow(uci), 2)`%** of raw listings, and bedroom count was missing in **`r round(100 * missing_n["bedrooms"] / nrow(uci), 2)`%**. The sample contains **`r format(nrow(listings), big.mark = ",")` listings** after eligibility checks. The geographic reference is **`r market_reference`**.
+
+The proposed primary model relates monthly asking rent to floor area, bedroom count, bathroom count and pet policy within the same city. The bathroom imputation affects **`r sum(!reported_bathroom_rows)` listings (`r round(100 * mean(!reported_bathroom_rows), 2)`%)**. Use the same model with `reported_bathroom_rows` for the sensitivity check.
+
+### Unusual values and distributions
+
+Flag values outside the conventional 1.5 × IQR fences for review. Keep valid extreme observations at this stage because high asking rents or unusually large units can be real market observations. Investigation of individual values and model influence can guide a later sensitivity analysis.
+
+```{r}
+#| label: review-extremes
+distribution <- function(values) {
+  values <- values[is.finite(values)]
+  if (length(values) == 0L) {
+    return(c(Minimum = NA, Q1 = NA, Median = NA, Q3 = NA, Maximum = NA, Flagged = 0))
+  }
+  quartiles <- quantile(values, c(0.25, 0.75), names = FALSE)
+  fences <- quartiles + c(-1, 1) * 1.5 * diff(quartiles)
+  c(
+    Minimum = min(values), Q1 = quartiles[1], Median = median(values),
+    Q3 = quartiles[2], Maximum = max(values),
+    Flagged = sum(values < fences[1] | values > fences[2])
+  )
+}
+knitr::kable(rbind(
+  "Monthly asking rent (USD)" = distribution(listings$price),
+  "Floor area (sq ft)" = distribution(listings$square_feet),
+  "Bedrooms" = distribution(listings$bedrooms),
+  "Bathrooms (prepared)" = distribution(listings$bathrooms_prepared)
+))
+knitr::kable(aggregate(price ~ pet_policy, data = listings, FUN = median),
+             col.names = c("Pet policy", "Median asking rent (USD)"))
+
+old_par <- par(mfrow = c(1, 2))
+hist(log10(listings$price), main = "Monthly asking rent", xlab = "log10 USD")
+hist(log10(listings$square_feet), main = "Floor area", xlab = "log10 square feet")
+invisible(par(old_par))
+```
+
+The IQR rule flagged `r distribution(listings$price)["Flagged"]` rents and `r distribution(listings$square_feet)["Flagged"]` floor areas. All flagged rows that met the eligibility rules remain in the prepared sample. The histograms use a log scale to show the right tails more clearly. The rent variable remains in dollars.
+
+### Aligning supplementary sources to the UCI window
+
+#### Minimum wage by state and posting date
+
+Use dated state minimum wage changes to carry forward the rate in force on each day of the UCI window. Discard changes after the last listing date. An older change can supply the rate at the start of the window if it was still in force. Take the higher of the general state rate and the federal rate of \$7.25 during this window. This gives a **state or federal benchmark**. City-specific rates and worker-specific exceptions may differ. The Department of Labor annual table is useful for reference. The date match uses the dated series. [Vaghul and Zipperer state wage series](https://github.com/benzipperer/historicalminwage/releases/tag/v1.4.0) · [Department of Labor federal wage history](https://www.dol.gov/agencies/whd/minimum-wage/history/chart)
+
+Audit the wage fields used in the date match. A change record without a general wage does not overwrite the prior rate. Records with an invalid state, date, or wage cannot set a new benchmark. The state and date form the key. Repeated keys require review before matching. Review extreme benchmark values against the published schedule and keep valid rates.
+
+```{r}
+#| label: wage-window-and-join
+if (!exists("listings", inherits = FALSE) ||
+    !all(c("posting_date", "city_state") %in% names(listings)) ||
+    !exists("distribution", mode = "function")) {
+  stop("Run the UCI preparation first. In RStudio, choose Run All Chunks Above.",
+       call. = FALSE)
+}
+if (!requireNamespace("readxl", quietly = TRUE)) {
+  stop("The wage block requires readxl. Install it with install.packages('readxl').",
+       call. = FALSE)
+}
+wage_zip <- file.path(data_dir, "vaghul-zipperer-state-wages-v1.4.0.zip")
+if (!file.exists(wage_zip)) stop("Missing wage archive: ", wage_zip, call. = FALSE)
+wage_xlsx <- unzip(
+  wage_zip,
+  files = "mw_state_changes.xlsx", exdir = working_dir
+)
+wage_source <- readxl::read_excel(wage_xlsx)
+wage_changes <- data.frame(
+  state = toupper(trimws(wage_source[["State Abbreviation"]])),
+  effective_date = as.Date(sprintf(
+    "%04d-%02d-%02d", wage_source$year, wage_source$month, wage_source$day
+  ), format = "%Y-%m-%d"),
+  state_wage = suppressWarnings(as.numeric(wage_source$mw))
+)
+missing_wage_fields <- c(
+  sum(is.na(wage_changes$state) | wage_changes$state == ""),
+  sum(!complete.cases(wage_source[c("year", "month", "day")])),
+  sum(is.na(wage_source$mw))
+)
+knitr::kable(data.frame(
+  Field = names(wage_changes),
+  Missing = missing_wage_fields,
+  Missing_pct = round(100 * missing_wage_fields / nrow(wage_changes), 2)
+))
+valid_state <- wage_changes$state %in% c(state.abb, "DC")
+valid_date <- !is.na(wage_changes$effective_date)
+valid_rate <- is.finite(wage_changes$state_wage) & wage_changes$state_wage >= 0
+dated_keys <- wage_changes[valid_state & valid_date, c("state", "effective_date")]
+knitr::kable(data.frame(
+  Source_rows = nrow(wage_changes),
+  Exact_repeat_rows = sum(duplicated(wage_changes)),
+  Repeated_state_date_keys = sum(duplicated(dated_keys)),
+  Invalid_state = sum(!is.na(wage_changes$state) & wage_changes$state != "" & !valid_state),
+  Invalid_date = sum(!valid_date) - missing_wage_fields[2],
+  Invalid_wage = sum(!is.na(wage_source$mw) & !valid_rate)
+))
+stopifnot(!anyDuplicated(dated_keys))
+stopifnot(all(format(window, "%Y") == "2019"))
+market_states <- sort(unique(listings$state))
+stopifnot(all(market_states %in% wage_changes$state))
+
+wage_changes <- subset(
+  wage_changes,
+  state %in% market_states & valid_date & effective_date <= window[2] & valid_rate
+)
+wage_changes <- wage_changes[order(wage_changes$state, wage_changes$effective_date), ]
+
+wages_in_window <- expand.grid(
+  state = market_states, posting_date = seq(window[1], window[2], by = "day"),
+  KEEP.OUT.ATTRS = FALSE, stringsAsFactors = FALSE
+)
+wages_in_window$hourly_wage_benchmark <- 7.25
+for (state in market_states) {
+  rows <- wages_in_window$state == state
+  changes <- wage_changes[wage_changes$state == state, ]
+  index <- findInterval(
+    as.numeric(wages_in_window$posting_date[rows]), as.numeric(changes$effective_date)
+  )
+  rates <- c(NA_real_, changes$state_wage)[index + 1L]
+  wages_in_window$hourly_wage_benchmark[rows] <- pmax(7.25, rates, na.rm = TRUE)
+}
+
+wage_match <- match(
+  paste(listings$state, listings$posting_date),
+  paste(wages_in_window$state, wages_in_window$posting_date)
+)
+stopifnot(!anyNA(wage_match))
+listings$hourly_wage_benchmark <- wages_in_window$hourly_wage_benchmark[wage_match]
+knitr::kable(data.frame(
+  First_date = min(wages_in_window$posting_date),
+  Last_date = max(wages_in_window$posting_date),
+  States_or_DC = length(market_states),
+  Matched_listings = sum(!is.na(wage_match))
+))
+knitr::kable(rbind(
+  "Wage benchmark across UCI listings (USD/hour)" = distribution(listings$hourly_wage_benchmark)
+))
+```
+
+#### Census rental availability and employment
+
+Use **2019 ACS one-year estimates** for rental vacancy and employment so their reference year matches the UCI posting year. The ACS covers January through December, while the UCI listings cover September through December. Treat the ACS measures as annual county context. The county coverage varies across tables. Preserve counties with published employment and occupancy estimates and leave the vacancy rate missing where the vacancy table has no record. Joining these measures to listings will require matching listing locations to county FIPS codes. [Census ACS 2019 Summary File](https://www.census.gov/programs-surveys/acs/data/summary-file/2019.html)
+
+Keep county FIPS codes as text to preserve leading zeroes. Verify the county key is unique in each table. Treat nonnumeric or negative counts as unavailable, and calculate rates only with valid denominators. Report source-field missingness within each published table and rate missingness after joining the Census tables. A missing vacancy estimate is left blank because it provides no evidence of zero vacancy. Values flagged by the IQR rule are retained when the source counts produce a valid rate.
+
+```{r}
+#| label: acs-county-preparation
+if (!exists("data_dir", inherits = FALSE) ||
+    !exists("uci", inherits = FALSE) ||
+    !exists("distribution", mode = "function")) {
+  stop("Run the UCI preparation first. In RStudio, choose Run All Chunks Above.",
+       call. = FALSE)
+}
+acs_year <- 2019L
+uci_years <- unique(as.integer(format(uci$posting_date[!is.na(uci$posting_date)], "%Y")))
+if (!identical(uci_years, acs_year)) {
+  stop("The UCI posting year and the ACS one-year reference year must match.",
+       call. = FALSE)
+}
+read_acs_counties <- function(table_id, fields) {
+  path <- file.path(data_dir, sprintf("acs%d-1yr-%s.dat", acs_year, tolower(table_id)))
+  if (!file.exists(path)) stop("Missing Census table: ", path, call. = FALSE)
+  acs <- read.delim(
+    path, sep = "|", quote = "", colClasses = "character",
+    check.names = FALSE, na.strings = c("", "NA")
+  )
+  county <- grepl("^0500000US[0-9]{5}$", acs$GEO_ID)
+  result <- data.frame(
+    county_fips = sub("^0500000US", "", acs$GEO_ID[county]),
+    acs[county, unname(fields), drop = FALSE]
+  )
+  names(result)[-1] <- names(fields)
+  audit <- data.frame(
+    Table = table_id, Field = names(fields), Published_counties = nrow(result),
+    Missing = integer(length(fields)), Invalid = integer(length(fields))
+  )
+  for (field in names(fields)) {
+    source_values <- result[[field]]
+    values <- suppressWarnings(as.numeric(source_values))
+    invalid <- !is.na(source_values) & (!is.finite(values) | values < 0)
+    audit$Missing[audit$Field == field] <- sum(is.na(source_values))
+    audit$Invalid[audit$Field == field] <- sum(invalid)
+    values[invalid] <- NA_real_
+    result[[field]] <- values
+  }
+  audit$Missing_pct <- round(100 * audit$Missing / nrow(result), 2)
+  duplicate_keys <- sum(duplicated(result$county_fips))
+  stopifnot(duplicate_keys == 0L)
+  list(data = result, audit = audit, duplicate_keys = duplicate_keys)
+}
+
+occupancy <- read_acs_counties("B25003", c(renter_occupied = "B25003_E003"))
+vacancy <- read_acs_counties("B25004", c(
+  vacant_for_rent = "B25004_E002", rented_still_vacant = "B25004_E003"
+))
+employment <- read_acs_counties("B23025", c(
+  civilian_labor_force = "B23025_E003", unemployed = "B23025_E005"
+))
+acs_tables <- list(B25003 = occupancy, B25004 = vacancy, B23025 = employment)
+knitr::kable(do.call(rbind, lapply(acs_tables, function(source) source$audit)),
+             row.names = FALSE)
+knitr::kable(data.frame(
+  Table = names(acs_tables),
+  Repeated_county_keys = vapply(acs_tables, function(source) source$duplicate_keys, integer(1))
+), row.names = FALSE)
+acs_context <- Reduce(function(left, right) {
+  merge(left, right, by = "county_fips", all = TRUE)
+}, lapply(acs_tables, function(source) source$data))
+acs_context$reference_year <- acs_year
+acs_context$period_start <- as.Date(sprintf("%d-01-01", acs_year))
+acs_context$period_end <- as.Date(sprintf("%d-12-31", acs_year))
+rental_stock <- with(acs_context, renter_occupied + vacant_for_rent + rented_still_vacant)
+acs_context$rental_vacancy_pct <- ifelse(
+  rental_stock > 0, 100 * acs_context$vacant_for_rent / rental_stock, NA_real_
+)
+acs_context$unemployment_pct <- with(acs_context, ifelse(
+  civilian_labor_force > 0 & unemployed <= civilian_labor_force,
+  100 * unemployed / civilian_labor_force, NA_real_
+))
+knitr::kable(data.frame(
+  UCI_posting_year = uci_years, ACS_reference_year = acs_year,
+  Period_start = min(acs_context$period_start), Period_end = max(acs_context$period_end),
+  County_records = nrow(acs_context)
+))
+missing_rates <- colSums(is.na(acs_context[c("rental_vacancy_pct", "unemployment_pct")]))
+knitr::kable(data.frame(
+  Indicator = c("Rental vacancy rate", "Unemployment rate"),
+  Counties_with_estimate = nrow(acs_context) - missing_rates,
+  Counties_missing_estimate = missing_rates,
+  Missing_pct = round(100 * missing_rates / nrow(acs_context), 2)
+), row.names = FALSE)
+knitr::kable(rbind(
+  "County rental vacancy rate (%)" = distribution(acs_context$rental_vacancy_pct),
+  "County unemployment rate (%)" = distribution(acs_context$unemployment_pct)
+), digits = 2)
+```
