@@ -12,7 +12,7 @@ In RStudio, use **Run All** to execute the preparation in order, or use **Render
 
 ### UCI listings and the analysis window
 
-The assigned UCI listings define the sample, asking rents, and posting dates. Use the 10,000-listing extract selected for this analysis. Derive the inclusive analysis window from its valid timestamps before applying listing filters. All dates below use UTC consistently. [UCI Apartment for Rent Classified](https://doi.org/10.24432/C5X623)
+Use the assigned 10,000-listing UCI extract to define the date window in UTC. [UCI Apartment for Rent Classified](https://doi.org/10.24432/C5X623)
 
 ```{r}
 #| label: import-uci
@@ -70,7 +70,7 @@ knitr::kable(data.frame(
 
 ### Missing values, duplicates, and variable types
 
-Report missingness on all source rows before filtering. Check for identical records, repeated listing IDs, and identical content under different IDs. The unit of analysis is a listing. Different ads for the same address may describe different units or listing events, so address alone is insufficient evidence of duplication.
+Audit missing fields, duplicate records and IDs, and numeric conversions before filtering.
 
 ```{r}
 #| label: uci-quality-audit
@@ -111,9 +111,112 @@ knitr::kable(as.data.frame(table(listings$has_photo, useNA = "ifany")),
              col.names = c("Raw photo category", "Listings"))
 ```
 
-Retain apartment ads with a clearly monthly asking price in USD, positive price and floor area, a valid bedroom count, and a city and state for within-market comparisons. Keep zero bedrooms as a valid studio count. For a missing bathroom count, use one bathroom as a conservative working assumption and flag the imputation. Preserve reported half-baths. A later sensitivity check will repeat the model using listings with reported bathroom counts.
+### Location recovery by ZIP code
 
-Interpret `None` in `pets_allowed` as neither cats nor dogs permitted for this analysis. Use it as the reference category. Listings reporting cats, dogs, or both form the **Cats or dogs allowed** category. Blank entries stay in **Policy unknown** because the listing gives no basis for inferring the rule. Use the most frequent city–state pair as the geographic reference. Retain the prepared pool and photo indicators for supplementary analyses.
+Use a unique ZIP match to fill missing locations or correct a conflicting state. Use the postal city and state together. Fill empty coordinate pairs with the ZIP reference point. [GeoNames US postal codes](https://download.geonames.org/export/zip/)
+
+For two listings without an extractable ZIP, the property address confirms Houston, TX, for one. For the other, the description names Seffner and the coordinates fall in Trilby. Both point to Florida, so fill the state only. [Houston property address](https://www.theselenaapartments.com/contact/) · [Census coordinate lookup](https://geocoding.geo.census.gov/geocoder/Geocoding_Services_API.html)
+
+```{r}
+#| label: recover-uci-location
+postal_zip <- file.path(data_dir, "geonames-us-postal.zip")
+if (!file.exists(postal_zip)) stop("Missing GeoNames ZIP reference: ", postal_zip)
+postal <- read.delim(
+  unz(postal_zip, "US.txt"), header = FALSE, sep = "\t",
+  quote = "", colClasses = "character", fileEncoding = "UTF-8"
+)
+postal <- unique(postal[c(2, 3, 5, 10, 11)])
+names(postal) <- c("zip", "city", "state", "latitude", "longitude")
+postal$latitude <- parse_number(postal$latitude)
+postal$longitude <- parse_number(postal$longitude)
+multiple_matches <- duplicated(postal$zip) | duplicated(postal$zip, fromLast = TRUE)
+postal <- postal[!multiple_matches, ]
+
+location_missing <- is.na(listings$cityname) & is.na(listings$state)
+location_rows <- which(location_missing)
+description <- listings$body
+description[is.na(description)] <- ""
+zip_pattern <- ",\\s*([0-9]{4,5}),\\s*([A-Z]{2})(?=[A-Z][a-z]|[[:space:][:punct:]]|$)"
+zip_matches <- regmatches(description, regexec(zip_pattern, description, perl = TRUE))
+location_text <- t(vapply(zip_matches, function(parts) {
+  if (length(parts) == 3L) parts[-1L] else rep(NA_character_, 2L)
+}, character(2)))
+description_zip <- ifelse(is.na(location_text[, 1]), NA_character_,
+                          sprintf("%05d", as.integer(location_text[, 1])))
+extracted <- location_text[location_rows, , drop = FALSE]
+zip <- description_zip[location_rows]
+postal_row <- match(zip, postal$zip)
+matched <- !is.na(postal_row)
+recovered <- location_rows[matched]
+listings$location_source <- ifelse(location_missing, "Unresolved", "UCI fields")
+listings$cityname[recovered] <- postal$city[postal_row[matched]]
+listings$state[recovered] <- postal$state[postal_row[matched]]
+listings$location_source[recovered] <- "ZIP in UCI description"
+listings$location_zip <- NA_character_
+listings$location_zip[recovered] <- zip[matched]
+
+matched_postal <- postal[postal_row[matched], ]
+can_fill_coordinates <- is.na(listings$latitude[recovered]) &
+  is.na(listings$longitude[recovered]) &
+  is.finite(matched_postal$latitude) & is.finite(matched_postal$longitude) &
+  abs(matched_postal$latitude) <= 90 & abs(matched_postal$longitude) <= 180
+filled_coordinates <- recovered[can_fill_coordinates]
+listings$latitude[filled_coordinates] <- matched_postal$latitude[can_fill_coordinates]
+listings$longitude[filled_coordinates] <- matched_postal$longitude[can_fill_coordinates]
+listings$coordinates_imputed <- seq_len(nrow(listings)) %in% filled_coordinates
+
+manual_locations <- data.frame(
+  id = c("5668609417", "5667488041"),
+  city = c("Houston", NA_character_),
+  state = c("TX", "FL"),
+  zip = c("77015", NA_character_),
+  source = c("Verified property address", "State agrees; city conflicts")
+)
+manual_rows <- match(manual_locations$id, listings$id)
+stopifnot(!anyNA(manual_rows),
+          all(is.na(listings$cityname[manual_rows]) & is.na(listings$state[manual_rows])))
+listings$cityname[manual_rows] <- manual_locations$city
+listings$state[manual_rows] <- manual_locations$state
+listings$location_zip[manual_rows] <- manual_locations$zip
+listings$location_source[manual_rows] <- manual_locations$source
+
+state_postal_row <- match(description_zip, postal$zip)
+state_conflicts <- which(
+  listings$location_source == "UCI fields" & !is.na(listings$state) &
+    !is.na(state_postal_row) & listings$state != postal$state[state_postal_row]
+)
+corrected_postal <- postal[state_postal_row[state_conflicts], ]
+state_corrections <- data.frame(
+  ZIP = corrected_postal$zip,
+  Original_city = listings$cityname[state_conflicts],
+  Original_state = listings$state[state_conflicts],
+  Postal_city = corrected_postal$city,
+  Postal_state = corrected_postal$state
+)
+listings$cityname[state_conflicts] <- corrected_postal$city
+listings$state[state_conflicts] <- corrected_postal$state
+listings$location_zip[state_conflicts] <- corrected_postal$zip
+listings$location_source[state_conflicts] <- "UCI state corrected by ZIP"
+knitr::kable(state_corrections, caption = "Location corrections where the UCI state differed from the ZIP")
+
+location_fields <- c("cityname", "state", "latitude", "longitude")
+knitr::kable(data.frame(
+  Field = location_fields,
+  Missing_before = as.integer(missing_n[location_fields]),
+  Missing_after = as.integer(colSums(is.na(listings[location_fields])))
+))
+knitr::kable(data.frame(
+  Recovered_by_ZIP = length(recovered),
+  Recovered_by_property_address = sum(!is.na(manual_locations$city)),
+  State_only = sum(is.na(manual_locations$city) & !is.na(manual_locations$state)),
+  Coordinate_pairs_filled_from_ZIP = length(filled_coordinates),
+  Text_state_differs_from_zip = sum(
+    extracted[matched, 2] != listings$state[recovered], na.rm = TRUE
+  )
+))
+```
+
+Use `None` as the pet-policy reference. Keep missing policies unknown in the primary model and assume they are flexible in a separate scenario. Impute one bathroom when missing and flag those records for a sensitivity check.
 
 ```{r}
 #| label: clean-uci
@@ -154,6 +257,11 @@ listings$pet_policy <- factor(
   levels = c("Neither cats nor dogs allowed", "Cats or dogs allowed", "Policy unknown")
 )
 primary_formula <- price ~ area_100_sqft + bedrooms + bathrooms_prepared + pet_policy + city_state
+listings$pet_policy_flexible <- factor(
+  ifelse(pet_code %in% "none", "Neither cats nor dogs allowed", "Allowed or assumed flexible"),
+  levels = c("Neither cats nor dogs allowed", "Allowed or assumed flexible")
+)
+flexible_pet_formula <- update(primary_formula, . ~ . - pet_policy + pet_policy_flexible)
 reported_bathroom_rows <- !listings$bathrooms_missing
 listings$photo_status <- factor(
   ifelse(listings$has_photo %in% c("Yes", "Thumbnail"), "Photo present",
@@ -170,21 +278,54 @@ listings$city_state <- factor(paste(listings$cityname, listings$state, sep = ", 
 market_reference <- names(sort(table(listings$city_state), decreasing = TRUE))[1]
 listings$city_state <- relevel(listings$city_state, ref = market_reference)
 
-knitr::kable(as.data.frame(table(listings$pet_policy)),
-             col.names = c("Prepared pet policy", "Listings"))
+scenario_counts <- table(listings$pet_policy, listings$pet_policy_flexible)
+knitr::kable(addmargins(scenario_counts),
+             caption = "Pet policy in the primary and flexible-policy scenarios")
 knitr::kable(data.frame(
-  Bathroom_status = c("Reported", "Imputed as one"),
-  Listings = c(sum(reported_bathroom_rows), sum(!reported_bathroom_rows))
+  Bathroom_sample = c("All eligible listings", "Reported bathrooms only", "Imputed as one"),
+  Listings = c(nrow(listings), sum(reported_bathroom_rows), sum(!reported_bathroom_rows))
 ))
 ```
 
-The raw data had **`r sum(exact_duplicate)` exact repeat rows** and **`r sum(repeated_id)` repeated listing IDs**. Amenities were missing in **`r round(100 * missing_n["amenities"] / nrow(uci), 2)`%** of raw listings, and bedroom count was missing in **`r round(100 * missing_n["bedrooms"] / nrow(uci), 2)`%**. The sample contains **`r format(nrow(listings), big.mark = ",")` listings** after eligibility checks. The geographic reference is **`r market_reference`**.
+The city reference is **`r market_reference`**. The code prepares the primary formula and the two sensitivity scenarios for the regression stage.
 
-The proposed primary model relates monthly asking rent to floor area, bedroom count, bathroom count and pet policy within the same city. The bathroom imputation affects **`r sum(!reported_bathroom_rows)` listings (`r round(100 * mean(!reported_bathroom_rows), 2)`%)**. Use the same model with `reported_bathroom_rows` for the sensitivity check.
+### Coordinate quality for county matching
+
+Replace the repeated Kansas point with each listing's ZIP reference point. All ZIP-derived pairs are approximate. [GeoNames US postal codes](https://download.geonames.org/export/zip/)
+
+```{r}
+#| label: audit-county-coordinates
+has_coordinates <- with(listings, is.finite(latitude) & is.finite(longitude))
+invalid_coordinates <- has_coordinates &
+  with(listings, abs(latitude) > 90 | abs(longitude) > 180)
+source_rows <- match(listings$id, uci$id)
+kansas_placeholder <- parse_number(uci$latitude[source_rows]) %in% 39.8163 &
+  parse_number(uci$longitude[source_rows]) %in% -98.5576
+
+placeholder_rows <- which(kansas_placeholder)
+replacement <- postal[match(listings$location_zip[placeholder_rows], postal$zip), ]
+stopifnot(
+  all(replacement$state == listings$state[placeholder_rows]),
+  all(is.finite(replacement$latitude) & abs(replacement$latitude) <= 90),
+  all(is.finite(replacement$longitude) & abs(replacement$longitude) <= 180)
+)
+listings$latitude[placeholder_rows] <- replacement$latitude
+listings$longitude[placeholder_rows] <- replacement$longitude
+
+listings$coordinate_status <- "Ready for geographic validation"
+listings$coordinate_status[!has_coordinates] <- "Missing coordinate pair"
+listings$coordinate_status[invalid_coordinates] <- "Outside coordinate bounds"
+listings$coordinate_status[listings$coordinates_imputed] <- "Missing pair filled from ZIP"
+listings$coordinate_status[placeholder_rows] <- "Kansas placeholder replaced from ZIP"
+listings$coordinates_imputed[placeholder_rows] <- TRUE
+
+knitr::kable(as.data.frame(table(listings$coordinate_status)),
+             col.names = c("Coordinate status", "Listings"))
+```
 
 ### Unusual values and distributions
 
-Flag values outside the conventional 1.5 × IQR fences for review. Keep valid extreme observations at this stage because high asking rents or unusually large units can be real market observations. Investigation of individual values and model influence can guide a later sensitivity analysis.
+Flag observations outside the 1.5 × IQR fences. Retain valid extremes.
 
 ```{r}
 #| label: review-extremes
@@ -215,8 +356,6 @@ hist(log10(listings$price), main = "Monthly asking rent", xlab = "log10 USD")
 hist(log10(listings$square_feet), main = "Floor area", xlab = "log10 square feet")
 invisible(par(old_par))
 ```
-
-The IQR rule flagged `r distribution(listings$price)["Flagged"]` rents and `r distribution(listings$square_feet)["Flagged"]` floor areas. All flagged rows that met the eligibility rules remain in the prepared sample. The histograms use a log scale to show the right tails more clearly. The rent variable remains in dollars.
 
 ### Aligning supplementary sources to the UCI window
 
@@ -319,7 +458,7 @@ knitr::kable(rbind(
 
 #### Census rental availability and employment
 
-Use **2019 ACS one-year estimates** for rental vacancy and employment so their reference year matches the UCI posting year. The ACS covers January through December, while the UCI listings cover September through December. Treat the ACS measures as annual county context. The county coverage varies across tables. Preserve counties with published employment and occupancy estimates and leave the vacancy rate missing where the vacancy table has no record. Joining these measures to listings will require matching listing locations to county FIPS codes. [Census ACS 2019 Summary File](https://www.census.gov/programs-surveys/acs/data/summary-file/2019.html)
+Use annual 2019 ACS estimates as county context for the September–December listings. Keep unpublished estimates missing. [Census ACS 2019 Summary File](https://www.census.gov/programs-surveys/acs/data/summary-file/2019.html)
 
 Keep county FIPS codes as text to preserve leading zeroes. Verify the county key is unique in each table. Treat nonnumeric or negative counts as unavailable, and calculate rates only with valid denominators. Report source-field missingness within each published table and rate missingness after joining the Census tables. A missing vacancy estimate is left blank because it provides no evidence of zero vacancy. Values flagged by the IQR rule are retained when the source counts produce a valid rate.
 
@@ -414,3 +553,534 @@ knitr::kable(rbind(
   "County unemployment rate (%)" = distribution(acs_context$unemployment_pct)
 ), digits = 2)
 ```
+
+## 4. Exploratory Data Analysis
+
+### Asking rent and floor area
+
+```{r}
+#| label: eda-rent-area
+#| fig-width: 7
+#| fig-height: 3.9
+#| fig-cap: "Monthly asking rent and floor area. The display ends at the 99th percentiles for readability. All listings enter the descriptive trend."
+area_view <- quantile(listings$square_feet, c(0, 0.99))
+rent_view <- quantile(listings$price, c(0, 0.99))
+plot(price ~ square_feet, data = listings, xlim = area_view, ylim = rent_view,
+     pch = 16, cex = 0.55, col = adjustcolor("#2C6682", alpha.f = 0.25),
+     xlab = "Floor area (square feet)", ylab = "Monthly asking rent (USD)")
+lines(lowess(listings$square_feet, listings$price), col = "#912E30", lwd = 2)
+numeric_eda <- listings[c("price", "square_feet", "bedrooms", "bathrooms_prepared")]
+knitr::kable(cor(numeric_eda, method = "spearman"), digits = 2,
+             caption = "Spearman correlations among numeric model variables")
+```
+
+Asking rent generally rises with floor area, with substantial variation at similar sizes. Floor area and bathroom count are also closely related.
+
+### Bedrooms and bathrooms
+
+```{r}
+#| label: eda-rent-layout
+#| fig-width: 7
+#| fig-height: 3.7
+#| fig-cap: "Asking rent by bedroom and bathroom count. The rent axis uses a logarithmic scale, and the upper groups are pooled for display."
+bedroom_group <- factor(ifelse(listings$bedrooms >= 4, "4+", listings$bedrooms),
+                        levels = c("0", "1", "2", "3", "4+"))
+bathroom_group <- factor(ifelse(listings$bathrooms_prepared >= 3, "3+",
+                                listings$bathrooms_prepared),
+                         levels = c("1", "1.5", "2", "2.5", "3+"))
+old_par <- par(mfrow = c(1, 2), mar = c(4.1, 4.3, 1, 0.6))
+boxplot(listings$price ~ bedroom_group, log = "y", col = "#C8DDE6",
+        xlab = "Bedrooms", ylab = "Monthly asking rent (USD)")
+boxplot(listings$price ~ bathroom_group, log = "y", col = "#C8DDE6",
+        xlab = "Bathrooms", ylab = "Monthly asking rent (USD)")
+invisible(par(old_par))
+
+layout_summary <- function(group, feature) {
+  prices <- split(listings$price, group)
+  data.frame(Feature = feature, Count_group = names(prices),
+             Listings = lengths(prices), Median_rent_USD = vapply(prices, median, numeric(1)),
+             row.names = NULL)
+}
+layout_eda <- rbind(layout_summary(bedroom_group, "Bedrooms"),
+                    layout_summary(bathroom_group, "Bathrooms"))
+knitr::kable(layout_eda, caption = "Asking rent by bedroom and bathroom count")
+```
+
+Median rent increases with bathroom count and generally rises from one bedroom onward. Studios have a higher pooled median than one-bedroom listings, which makes market and size adjustment important.
+
+### Pet policy within cities
+
+```{r}
+#| label: eda-pet-within-city
+#| fig-width: 7
+#| fig-height: 3.6
+#| fig-cap: "Median asking rent by explicit pet policy in six cities with at least 10 listings in each comparison group."
+pet_counts <- xtabs(~ city_state + pet_policy, listings)
+eligible_cities <- pet_counts[, 1] >= 10 & pet_counts[, 2] >= 10
+selected_cities <- head(names(sort(rowSums(pet_counts)[eligible_cities], decreasing = TRUE)), 6)
+pet_medians <- with(listings, tapply(price, list(city_state, pet_policy), median))
+comparison <- pet_medians[selected_cities, 1:2, drop = FALSE]
+pet_colors <- c("#46647A", "#B04B35")
+city_index <- seq_along(selected_cities)
+old_par <- par(mar = c(4.1, 8, 2, 1))
+plot(comparison[, 1], city_index, type = "n", xlim = range(comparison),
+     yaxt = "n", ylab = "", xlab = "Median monthly asking rent (USD)")
+axis(2, at = city_index, labels = selected_cities, las = 1)
+segments(comparison[, 1], city_index, comparison[, 2], city_index, col = "gray70")
+points(comparison[, 1], city_index, pch = 16, col = pet_colors[1])
+points(comparison[, 2], city_index, pch = 17, col = pet_colors[2])
+legend("top", inset = c(0, -0.12), xpd = NA, horiz = TRUE,
+       legend = c("Neither allowed", "Cats or dogs allowed"),
+       pch = c(16, 17), col = pet_colors, bty = "n", cex = 0.8)
+invisible(par(old_par))
+
+knitr::kable(data.frame(
+  City = selected_cities, Neither_allowed_n = pet_counts[selected_cities, 1],
+  Allowed_n = pet_counts[selected_cities, 2], Unknown_n = pet_counts[selected_cities, 3],
+  Neither_allowed_median_USD = comparison[, 1], Allowed_median_USD = comparison[, 2],
+  row.names = NULL
+))
+pet_group_eda <- data.frame(
+  Policy = levels(listings$pet_policy),
+  Listings = as.integer(colSums(pet_counts)),
+  Median_rent_USD = as.numeric(tapply(listings$price, listings$pet_policy, median))
+)
+knitr::kable(pet_group_eda, caption = "Asking rent by pet policy across all listings")
+```
+
+Pet-friendly listings have a higher median in `r sum(comparison[, 2] > comparison[, 1])` of the `r nrow(comparison)` displayed cities. The regression will compare these policies while accounting for property size and layout.
+
+### County vacancy, employment, and affordability
+
+Match source coordinates to 2019 county boundaries and verify the state. For ZIP-derived points and state corrections, use the 2020 Census postal-area crosswalk only when it identifies one land county that agrees with the listing state. Join the annual Census estimates by county FIPS and year. [2019 county boundaries](https://www.census.gov/geographies/mapping-files/2019/geo/carto-boundary-file.html) · [2020 ZCTA county crosswalk](https://www.census.gov/geographies/reference-files/time-series/geo/relationship-files.2020.html)
+
+```{r}
+#| label: join-acs-by-county
+# A running R session may not see a user library created after startup.
+user_library_paths <- strsplit(Sys.getenv("R_LIBS_USER"), .Platform$path.sep, fixed = TRUE)[[1]]
+.libPaths(c(.libPaths(), user_library_paths))
+if (!length(find.package("sf", quiet = TRUE))) {
+  stop("County matching requires the sf package. Install it with install.packages('sf').",
+       call. = FALSE)
+}
+county_files <- unzip(file.path(data_dir, "cb_2019_us_county_500k.zip"),
+                      exdir = working_dir)
+county_shape <- sf::st_read(county_files[grepl("[.]shp$", county_files)], quiet = TRUE)
+county_crs <- 9311
+county_shape <- sf::st_make_valid(sf::st_transform(county_shape["GEOID"], county_crs))
+
+state_fips <- setNames(c(
+  "01", "02", "04", "05", "06", "08", "09", "10", "12", "13",
+  "15", "16", "17", "18", "19", "20", "21", "22", "23", "24",
+  "25", "26", "27", "28", "29", "30", "31", "32", "33", "34",
+  "35", "36", "37", "38", "39", "40", "41", "42", "44", "45",
+  "46", "47", "48", "49", "50", "51", "53", "54", "55", "56", "11"
+), c(state.abb, "DC"))
+expected_state <- unname(state_fips[listings$state])
+
+source_rows <- which(listings$coordinate_status == "Ready for geographic validation" &
+                     listings$location_source != "UCI state corrected by ZIP")
+points_sf <- sf::st_as_sf(listings[source_rows, ], coords = c("longitude", "latitude"),
+                         crs = 4326)
+hits <- sf::st_intersects(sf::st_transform(points_sf, county_crs), county_shape)
+point_county <- vapply(hits, function(hit) {
+  if (length(hit) == 1L) county_shape$GEOID[hit] else NA_character_
+}, character(1))
+point_agrees <- !is.na(point_county) &
+  substr(point_county, 1, 2) == expected_state[source_rows]
+listings$county_fips <- NA_character_
+listings$county_fips[source_rows[point_agrees]] <- point_county[point_agrees]
+listings$county_match <- ifelse(is.na(listings$county_fips), "Unresolved", "Source coordinates")
+
+zcta <- read.delim(file.path(data_dir, "census-2020-zcta-county.txt"), sep = "|",
+                   quote = "", colClasses = "character", fileEncoding = "UTF-8-BOM")
+zcta <- unique(zcta[parse_number(zcta$AREALAND_PART) > 0,
+                    c("GEOID_ZCTA5_20", "GEOID_COUNTY_20")])
+repeated_zcta <- duplicated(zcta$GEOID_ZCTA5_20) |
+  duplicated(zcta$GEOID_ZCTA5_20, fromLast = TRUE)
+zcta <- zcta[!repeated_zcta, ]
+zip_county <- zcta$GEOID_COUNTY_20[match(listings$location_zip, zcta$GEOID_ZCTA5_20)]
+zip_agrees <- is.na(listings$county_fips) & zip_county %in% county_shape$GEOID &
+  substr(zip_county, 1, 2) == expected_state
+listings$county_fips[zip_agrees] <- zip_county[zip_agrees]
+listings$county_match[zip_agrees] <- "Single-county ZIP area"
+
+acs_row <- match(paste(listings$county_fips, format(listings$posting_date, "%Y")),
+                 paste(acs_context$county_fips, acs_context$reference_year))
+listings$rental_vacancy_pct <- acs_context$rental_vacancy_pct[acs_row]
+listings$unemployment_pct <- acs_context$unemployment_pct[acs_row]
+listings$county_name <- county_shape$NAME[match(listings$county_fips, county_shape$GEOID)]
+coverage <- c(
+  "Source coordinate matched" = sum(listings$county_match == "Source coordinates"),
+  "Single-county ZIP area matched" = sum(zip_agrees),
+  "County unresolved" = sum(is.na(listings$county_fips)),
+  "ACS vacancy available" = sum(!is.na(listings$rental_vacancy_pct)),
+  "ACS unemployment available" = sum(!is.na(listings$unemployment_pct))
+)
+knitr::kable(data.frame(
+  Coverage = names(coverage), Listings = as.integer(coverage),
+  Percent = round(100 * coverage / nrow(listings), 2), row.names = NULL
+))
+```
+
+```{r}
+#| label: eda-county-rent-affordability
+#| fig-width: 8
+#| fig-height: 3.6
+#| fig-cap: "Asking rent and affordability by county. Each point represents a county with at least 10 listings and the relevant ACS estimate."
+listings$hours_for_monthly_rent <- listings$price / listings$hourly_wage_benchmark
+listings$hours_for_upfront_payment <- 3 * listings$hours_for_monthly_rent
+work_month_hours <- 160
+median_wage <- median(listings$hourly_wage_benchmark)
+affordability_eda <- data.frame(
+  Scenario = c("One month of asking rent", "Hypothetical payment of three months' rent"),
+  Median_gross_work_hours = round(c(median(listings$hours_for_monthly_rent),
+                                   median(listings$hours_for_upfront_payment)), 1)
+)
+knitr::kable(affordability_eda)
+
+county_eda <- aggregate(cbind(price, hours_for_monthly_rent) ~ county_fips,
+                         data = listings, FUN = median)
+county_eda$listings <- as.integer(table(listings$county_fips)[county_eda$county_fips])
+context_row <- match(county_eda$county_fips, acs_context$county_fips)
+county_eda$rental_vacancy_pct <- acs_context$rental_vacancy_pct[context_row]
+county_eda$unemployment_pct <- acs_context$unemployment_pct[context_row]
+rent_counties <- subset(county_eda, listings >= 10 & !is.na(rental_vacancy_pct))
+labor_counties <- subset(county_eda, listings >= 10 & !is.na(unemployment_pct))
+association <- c(
+  cor(rent_counties$rental_vacancy_pct, rent_counties$price, method = "spearman"),
+  cor(labor_counties$unemployment_pct, labor_counties$hours_for_monthly_rent, method = "spearman")
+)
+county_associations <- data.frame(
+  Comparison = c("Vacancy and asking rent", "Unemployment and gross work hours"),
+  Counties = c(nrow(rent_counties), nrow(labor_counties)),
+  Spearman_rho = round(association, 2)
+)
+knitr::kable(county_associations)
+
+old_par <- par(mfrow = c(1, 2), mar = c(4.2, 4.5, 0.7, 0.6))
+plot(price ~ rental_vacancy_pct, data = rent_counties, pch = 16, col = "#2C6682",
+     xlab = "Annual rental vacancy (%)", ylab = "Median asking rent (USD)")
+plot(hours_for_monthly_rent ~ unemployment_pct, data = labor_counties,
+     pch = 16, col = "#2C6682",
+     xlab = "Annual unemployment (%)", ylab = "Median gross work hours")
+invisible(par(old_par))
+```
+
+The county plots show negative rank associations. Gross hours use the state or federal wage benchmark, and the three-month payment is hypothetical.
+
+## 5. Linear Regression Analysis
+
+Model 1 compares apartments within cities. Models 2 and 3 use the same vacancy-covered sample to assess what vacancy adds.
+
+```{r}
+#| label: estimate-rent-models
+if (!requireNamespace("sandwich", quietly = TRUE)) {
+  stop("Regression inference requires sandwich. Install it with install.packages('sandwich').")
+}
+vacancy_sample <- listings[!is.na(listings$rental_vacancy_pct), ]
+market_formula <- update(primary_formula, . ~ . - city_state)
+models <- list(
+  "Model 1" = lm(primary_formula, data = listings),
+  "Model 2" = lm(market_formula, data = vacancy_sample),
+  "Model 3" = lm(update(market_formula, . ~ . + rental_vacancy_pct), data = vacancy_sample)
+)
+clusters <- list(listings$city_state, vacancy_sample$county_fips, vacancy_sample$county_fips)
+stopifnot(
+  nobs(models[[1]]) == nrow(listings),
+  nobs(models[[2]]) == nrow(vacancy_sample),
+  identical(rownames(model.frame(models[[2]])), rownames(model.frame(models[[3]])))
+)
+
+terms_to_show <- c(
+  area_100_sqft = "Floor area (100 sq ft)",
+  bedrooms = "Bedrooms",
+  bathrooms_prepared = "Bathrooms",
+  "pet_policyCats or dogs allowed" = "Cats or dogs allowed",
+  "pet_policyPolicy unknown" = "Pet policy unknown",
+  rental_vacancy_pct = "County rental vacancy (percentage point)"
+)
+
+model_inference <- Map(function(model, cluster) {
+  estimates <- coef(model)
+  terms <- intersect(names(terms_to_show), names(estimates))
+  estimates <- estimates[terms]
+  errors <- sqrt(diag(sandwich::vcovCL(model, cluster = cluster, type = "HC1"))[terms])
+  df <- length(unique(cluster)) - 1L
+  critical <- qt(0.975, df)
+  data.frame(
+    Estimate = estimates, SE = errors, P = 2 * pt(-abs(estimates / errors), df),
+    Lower_95 = estimates - critical * errors, Upper_95 = estimates + critical * errors
+  )
+}, models, clusters)
+```
+
+```{r}
+#| label: report-rent-models
+format_p <- function(p) ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))
+format_coefficients <- function(inference) {
+  rows <- match(names(terms_to_show), rownames(inference))
+  result <- inference[rows, ]
+  stars <- cut(result$P, breaks = c(-Inf, 0.01, 0.05, 0.10, Inf),
+               labels = c("***", "**", "*", ""), right = FALSE)
+  ifelse(is.na(rows), "—", sprintf("%.2f%s\n(%.2f)", result$Estimate, stars, result$SE))
+}
+model_summaries <- lapply(models, summary)
+overall_f <- lapply(model_summaries, function(x) x$fstatistic)
+regression_table <- data.frame(
+  Predictor = c(unname(terms_to_show), "City controls", "Observations", "R²", "Adjusted R²",
+                "Overall F statistic", "Overall F p-value"),
+  check.names = FALSE
+)
+for (i in seq_along(models)) {
+  f <- overall_f[[i]]
+  regression_table[[names(models)[i]]] <- c(
+    format_coefficients(model_inference[[i]]), if (i == 1L) "Yes" else "No",
+    format(nobs(models[[i]]), big.mark = ","),
+    sprintf("%.3f", model_summaries[[i]]$r.squared),
+    sprintf("%.3f", model_summaries[[i]]$adj.r.squared),
+    sprintf("%.2f (%d, %d)", f[1], f[2], f[3]),
+    format_p(pf(f[1], f[2], f[3], lower.tail = FALSE))
+  )
+}
+display_table <- regression_table
+display_table[-1] <- lapply(display_table[-1], function(cells) {
+  gsub("\n", "<br>", gsub("<", "&lt;", cells, fixed = TRUE), fixed = TRUE)
+})
+knitr::kable(display_table, format = "html", escape = FALSE,
+             caption = "Table 1. Multiple linear regression of monthly asking rent in USD")
+```
+
+Coefficients are in USD. Parentheses show standard errors clustered by city in Model 1 and county in Models 2–3. Stars indicate `***` p \< 0.01, `**` p \< 0.05 and `*` p \< 0.10. The overall F statistic is the conventional OLS test, with numerator and denominator degrees of freedom in parentheses.
+
+## 7. Regression Diagnostics
+
+```{r}
+#| label: regression-diagnostics
+#| fig-width: 8
+#| fig-height: 6
+#| fig-cap: "Residuals versus fitted values and normal Q–Q plots for Models 1 and 3. Residual plots show the central 99% of each axis for readability."
+diagnostics <- lapply(models, function(model) {
+  leverage <- hatvalues(model)
+  usable <- leverage < 1 - 1e-8
+  residual <- residuals(model)[usable]
+  fitted <- fitted(model)[usable]
+  standard <- residual / (sigma(model) * sqrt(1 - leverage[usable]))
+  cook <- rep(NA_real_, nobs(model))
+  cook[usable] <- standard^2 * leverage[usable] / (model$rank * (1 - leverage[usable]))
+  fitted_cut <- quantile(fitted, c(0.2, 0.8))
+  list(
+    fitted = fitted, residual = residual, standard = standard, cook = cook,
+    unit_leverage = sum(!usable),
+    spread_ratio = sd(residual[fitted >= fitted_cut[2]]) / sd(residual[fitted <= fitted_cut[1]])
+  )
+})
+
+knitr::kable(data.frame(
+  Model = names(models),
+  "Residual SD ratio, highest to lowest fitted fifth" =
+    vapply(diagnostics, function(x) round(x$spread_ratio, 2), numeric(1)),
+  "Unit-leverage listings" = vapply(diagnostics, function(x) x$unit_leverage, integer(1)),
+  "Cook distance above 4/N" = vapply(seq_along(models), function(i) {
+    sum(diagnostics[[i]]$cook > 4 / nobs(models[[i]]), na.rm = TRUE)
+  }, integer(1)), check.names = FALSE
+), caption = "Residual spread and influence checks")
+
+old_par <- par(mfrow = c(2, 2), mar = c(4.1, 4.2, 2, 0.7))
+for (i in c(1, 3)) {
+  x <- diagnostics[[i]]
+  plot(x$fitted, x$residual, pch = 16, cex = 0.52, col = adjustcolor("#2C6682", 0.25),
+       xlim = quantile(x$fitted, c(0.005, 0.995)),
+       ylim = quantile(x$residual, c(0.005, 0.995)),
+       main = paste(names(models)[i], "residuals"),
+       xlab = "Fitted rent (USD)", ylab = "Residual (USD)")
+  abline(h = 0, lty = 2, col = "gray45")
+  lines(lowess(x$fitted, x$residual), col = "#912E30", lwd = 2)
+  qqnorm(x$standard, pch = 16, cex = 0.52, col = adjustcolor("#2C6682", 0.25),
+         main = paste(names(models)[i], "normal Q-Q"), ylab = "Standardized residual")
+  qqline(x$standard, col = "#912E30", lwd = 2)
+}
+invisible(par(old_par))
+```
+
+```{r}
+#| label: regression-sensitivity
+within_city <- function(values, city) {
+  group <- match(city, unique(city))
+  values - rowsum(values, group, reorder = FALSE)[group, , drop = FALSE] /
+    tabulate(group)[group]
+}
+
+within_city_fit <- function(formula, data) {
+  predictors <- model.matrix(update(formula, . ~ . - city_state), data = data)[, -1, drop = FALSE]
+  centered <- within_city(cbind(price = data$price, predictors), data$city_state)
+  lm.fit(centered[, -1, drop = FALSE], centered[, 1])$coefficients
+}
+
+numeric_terms <- c("area_100_sqft", "bedrooms", "bathrooms_prepared", "rental_vacancy_pct")
+main_design <- within_city(
+  model.matrix(market_formula, data = listings)[, -1, drop = FALSE], listings$city_state
+)
+vacancy_design <- model.matrix(models[[3]])[, -1, drop = FALSE]
+vif_main <- diag(solve(cor(main_design)))
+vif_vacancy <- diag(solve(cor(vacancy_design)))
+knitr::kable(data.frame(
+  Predictor = unname(terms_to_show[numeric_terms]),
+  Model_1 = unname(vif_main[numeric_terms]),
+  Model_3 = unname(vif_vacancy[numeric_terms])
+), digits = 2, caption = "Variance inflation factors for numeric predictors")
+
+influential <- lapply(diagnostics, function(x) {
+  head(order(x$cook, decreasing = TRUE, na.last = NA), 3)
+})
+check_terms <- c("bedrooms", "bathrooms_prepared", "pet_policyCats or dogs allowed")
+within_baseline <- within_city_fit(primary_formula, listings)
+stopifnot(isTRUE(all.equal(within_baseline[check_terms],
+                           coef(models[[1]])[check_terms], tolerance = 1e-8)))
+model_1_influence <- within_city_fit(primary_formula, listings[-influential[[1]], ])
+model_3_influence <- coef(lm(formula(models[[3]]), data = vacancy_sample[-influential[[3]], ]))
+reported_bathrooms_fit <- within_city_fit(primary_formula, listings[reported_bathroom_rows, ])
+flexible_policy_fit <- within_city_fit(flexible_pet_formula, listings)
+diagnostic_sensitivity <- data.frame(
+  Comparison = c("Model 1 bedroom", "Model 1 bathroom", "Model 1 pet allowance",
+                 "Model 3 county vacancy"),
+  Baseline = c(unname(within_baseline[check_terms]), coef(models[[3]])[["rental_vacancy_pct"]]),
+  Without_top_3_Cook = c(unname(model_1_influence[check_terms]),
+                         model_3_influence[["rental_vacancy_pct"]]),
+  Reported_bathrooms_only = c(unname(reported_bathrooms_fit[check_terms]), NA),
+  Flexible_pet_scenario = c(unname(flexible_policy_fit[check_terms[1:2]]),
+    flexible_policy_fit[["pet_policy_flexibleAllowed or assumed flexible"]], NA)
+)
+knitr::kable(diagnostic_sensitivity, digits = 2,
+             caption = "Sensitivity of selected coefficients in USD")
+```
+
+**Residuals.** The smoothers curve away from zero, the spread increases at higher fitted rents, and the Q-Q tails depart from the normal reference. Individual rent estimates, especially at the high end, warrant caution. Clustered errors address uneven variance and within-market dependence in coefficient inference.
+
+**Predictors and influence.** Numeric VIFs are below 2.4. Model 1 has 837 single-listing cities with unit leverage. The bedroom and bathroom estimates fall sharply in the sensitivity refits. The vacancy estimate changes little when the three most influential observations are set aside. Table 1 retains the full fitted samples.
+
+## 6. Interpretation of Results
+
+```{r}
+#| label: key-regression-intervals
+key_intervals <- rbind(
+  model_inference[[1]][names(terms_to_show)[1:5], c("Estimate", "Lower_95", "Upper_95")],
+  model_inference[[3]]["rental_vacancy_pct", c("Estimate", "Lower_95", "Upper_95")]
+)
+rownames(key_intervals) <- unname(terms_to_show)
+knitr::kable(key_intervals, digits = 2, caption = "Key estimates and 95% confidence intervals (USD)")
+```
+
+**Bedrooms and bathrooms.** Both full-sample estimates were positive and sensitive to influential listings. At the same floor area, another bedroom changes the layout. Another bathroom may add privacy and convenience.
+
+**Pets and floor area.** The confidence intervals span zero. The direction of the adjusted price differences remains uncertain.
+
+**Vacancy.** Higher vacancy was associated with lower asking rent. The adjusted R² comparison uses the same listings.
+
+**Affordability.** Gross work hours are a descriptive result. The example below assumes a 160-hour work month.
+
+```{r}
+#| label: summarize-affordability-results
+knitr::kable(data.frame(
+  Median_benchmark_USD_per_hour = median_wage,
+  Example_gross_pay_USD = round(median_wage * work_month_hours, 2),
+  Monthly_rent_pct_of_gross_pay = round(
+    100 * median(listings$hours_for_monthly_rent) / work_month_hours, 1
+  ),
+  Upfront_payment_months_of_gross_pay = round(
+    median(listings$hours_for_upfront_payment) / work_month_hours, 2
+  )
+))
+```
+
+## 8. Marketing Implications and Recommendations
+
+### Price and place
+
+**Statistical finding.** One percentage point more county vacancy was associated with USD 97 lower asking rent. The estimate was USD 94 lower in the influence check.
+
+**Marketing interpretation.** Higher vacancy gives landlords a reason to test offers with lower move-in costs. At the 2019 minimum-wage benchmark, one month's rent required a median of 145 gross work hours.
+
+**Recommended action.** Pilot a 14-month lease in higher-vacancy markets. Tenants pay only applicable utilities for the first two months, then pay the regular rent for 12 months. The two waived months reduce average base rent over the lease by 14.3%. Compare signed leases, vacancy days and net revenue with standard offers for similar units.
+
+### Product and promotion
+
+**Statistical finding.** The additional-bathroom estimate stayed positive across sensitivity checks, with a magnitude of about USD 206 to USD 441.
+
+**Marketing interpretation.** Bathroom availability may help distinguish apartments of similar size. The estimated premium varies across specifications.
+
+**Recommended action.** Show the bathroom count and floor plan in listings. Test whether highlighting those features improves inquiry-to-viewing conversion.
+
+### Promotion and price
+
+**Statistical finding.** The adjusted pet allowance estimate was USD 8 higher, with a 95% interval from USD 37 lower to USD 53 higher.
+
+**Marketing interpretation.** A price premium for accepting pets is uncertain. A clear pet policy helps renters judge whether a listing suits their household.
+
+**Recommended action.** State which pets are accepted and itemize monthly fees and move-in charges. Use current local rents and the locally applicable wage floor when evaluating affordability for a campaign.
+
+## 9. Limitations
+
+- **Advertised outcomes.** The UCI records asking rents. Part 2 should link listings to applications, signed rents, lease starts, and early terminations to measure conversion and retention.
+- **Time and geographic coverage.** The listings cover September–December 2019. The vacancy model uses 8,743 listings with available county estimates. A follow-up should track multiple periods and markets to assess rent changes and geographic coverage.
+- **Model sensitivity.** Residual trends and influential listings make the room estimates sensitive to the sample. A follow-up should verify floor area and bathroom counts and record unit condition and included services.
+- **Affordability proxy.** Gross pay at the wage floor and a hypothetical upfront payment approximate costs. A follow-up should measure household take-home pay, funds available at signing, and actual move-in charges.
+
+# Part 2 — Improved Research Design and Sampling Plan
+
+## Purpose
+
+Part 1 links higher vacancy to lower asking rent and estimates 145 gross work hours for one month's rent at the minimum-wage benchmark. At the sample median of US$`r format(round(median(listings$price)), big.mark = ",")`, waiving two months would save a tenant US$`r format(round(2 \* median(listings\$price)), big.mark = ",")\` in base rent. The pilot would measure the effects on signings and owner revenue.
+
+## 1. Critique the Existing Research Data
+
+The 2019 UCI listings support asking-rent comparisons. They lack signed terms, payments and lease outcomes. County measures are broad, room estimates are sensitive, and minimum wages approximate household resources.
+
+## 2. Improved Research Question
+
+In higher-vacancy markets, does waiving the first two months of rent increase 30-day lease signings, and how does it affect 14-month net revenue per unit? Compare faster leasing with the cost of the waiver.
+
+## 3. Variables and Measurement
+
+| Marketing concept | Proposed variable or measure | Collection method | Why it is needed |
+|----|----|----|----|
+| Property and market | Asking rent, area, bedrooms, bathrooms, pet policy, condition and current vacancy | Verified listing and market records | Compare units and update market context |
+| Lease conversion | Signed within 30 days (0/1) | Listing and contract timestamps | Measure the primary outcome |
+| Owner revenue | Rent received minus leasing and operating costs in 14 months | Owner ledgers | Value the offer after vacancies and concessions |
+| Affordability | Actual move-in charges, take-home pay and available funds | Billing records and optional applicant survey | Measure the cost and the budget |
+| Retention | Actual and scheduled lease end dates | Lease records | Track early exits |
+
+## 4. Data Collection and Analysis
+
+Both arms use the same 14-month term, stated monthly rent and utility terms, with no fees or deposit due at move-in. The promotion covers base rent in months 1–2. Tenants pay applicable utilities and start paying rent in month 3. Link platform, contract and owner records by listing ID.
+
+- **Logistic regression.** Signed by day 30 \~ assigned offer + sampling strata. Report the difference in predicted signing probabilities in percentage points.
+- **Linear regression.** Net revenue over 14 months from listing launch \~ assigned offer + sampling strata. Report the dollar difference per listing.
+
+Use original assignments, including unsigned listings, and report 95% confidence intervals. Summarize early exits descriptively.
+
+## 5. Sampling Plan
+
+Use vacant long-term apartments ready to list in four U.S. counties above the candidate counties' median vacancy. Screen partner inventories, exclude duplicates, unavailable units and existing promotions, and randomly retain one apartment per building. Draw proportionate samples by county and rent band, then assign offers 1:1 within each stratum before publication. Compare the sample with the frame and use administrative records for outcomes. Inference applies to eligible partner listings.
+
+```{r}
+#| label: part-2-sample-size
+lease_power <- power.prop.test(
+  p1 = 0.30, p2 = 0.42, sig.level = 0.05, power = 0.80,
+  alternative = "two.sided", strict = TRUE
+)
+data.frame(
+  minimum_per_arm = ceiling(lease_power$n),
+  planned_per_arm = 280L,
+  planned_total = 560L
+)
+```
+
+A rise from 30% to 42% is a planning assumption. Allow for incomplete records and recheck rates and dependence within property managers before launch.
+
+## 6. Expected Research Improvement
+
+- Asking rents → signed leases and ledgers → observed conversion and revenue.
+- Old, broad market data and sensitive estimates → current market measures and verified unit features → better comparisons.
+- Wage and move-in proxies → charges and household budgets → clearer affordability measures.
+- Observational associations → randomized offer → estimated effect of the promotion.
